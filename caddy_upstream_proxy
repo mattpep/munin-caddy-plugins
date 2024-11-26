@@ -1,0 +1,128 @@
+#!/usr/bin/perl -l
+
+=head1 NAME
+
+caddy_upstream_proxy - Reports on the health count of configured caddy upstream proxies
+
+=head1 CONFIGURATION
+
+None
+
+=head1 USAGE
+
+The Caddy admin API must be enabled at http://localhost:2019/ for the upstreams to be discovered.
+
+=head1 AUTHOR
+
+Matt Peperell <matt@peperell.com>
+
+=head1 LICENSE
+
+MIT
+
+=cut
+
+use strict;
+use warnings;
+
+require LWP::UserAgent;
+my $ua = LWP::UserAgent->new(agent => "munin-caddy_upstream_proxy/0.1", timeout => 10);
+
+use constant API => 'http://localhost:2019/metrics';
+
+my $response = $ua->get(API);
+
+
+my $graph_info = "Caddy";
+
+my $mode = (${ARGV[0] or "print"});
+
+my $body = $response->content();
+my @lines = split(/\n/, $body);
+
+if ($mode eq 'autoconfig') {
+    if (!$response->is_success) {
+        print "no (Could not talk to caddy at ". API . ")";
+    } else {
+        print "yes";
+    }
+    exit 0;
+}
+
+#   # HELP caddy_reverse_proxy_upstreams_healthy Health status of reverse proxy upstreams.
+#   # TYPE caddy_reverse_proxy_upstreams_healthy gauge
+#   caddy_reverse_proxy_upstreams_healthy{upstream="localhost:6000"} 1
+#   caddy_reverse_proxy_upstreams_healthy{upstream="unix//run/php/php8.2-fpm.sock"} 1
+#   caddy_reverse_proxy_upstreams_healthy{upstream="unix//run/powerdns-admin/socket"} 
+
+
+my @wanted_prefixes = (
+    'caddy_reverse_proxy_upstreams_healthy'
+# go_memstats
+);
+
+foreach (@lines) {
+    # e.g. # HELP caddy_reverse_proxy_upstreams_healthy Health status of reverse proxy upstreams.
+    if (/# HELP caddy_reverse_proxy_upstreams_healthy (.*).$/) {
+        $graph_info = $1;
+        last;
+    }
+}
+
+if ($mode eq 'config') {
+    # basic legends
+    my $basic = <<"EOT";
+host_name $ENV{FQDN}
+graph_category webserver
+graph_info $graph_info
+graph_title Upstream healthy count
+graph_vlabel Pool healthy size
+EOT
+    chomp $basic;
+    print $basic;
+
+    if (!$response->is_success) {
+        # Could not talk to Caddy API; we can't report about any metrics
+        exit 0;
+    }
+    # lines for each upstream
+    foreach (@lines) {
+        next unless /^caddy_reverse_proxy_upstreams_healthy/;
+        my $upstream_name = substr($_, 48);
+        $upstream_name =~ s/"}\s+\d+$//;
+        chomp $upstream_name;
+        my $field_name = "caddy_reverse_proxy_upstreams_healthy_" . convert_upstream_name($upstream_name);
+        print "$field_name.type GAUGE";
+        print "$field_name.label $upstream_name";
+    };
+    exit 0;
+}
+
+# We're in fetch mode if no argument is given
+foreach (@lines) {
+    if (!$response->is_success) {
+        # Could not talk to Caddy API; we can't report about any metrics
+        # We'd ideally like to report 'U' for each of the upstreams but we don't
+        exit 0;
+    }
+    next unless /^caddy_reverse_proxy_upstreams_healthy\{.*\} (\d+)$/;
+    my $upstream_name = substr($_, 48);
+    my $field_value = $1;
+    $upstream_name =~ s/"}\s+\d+$//;
+    chomp $upstream_name;
+    my $field_name = "caddy_reverse_proxy_upstreams_healthy_" . convert_upstream_name($upstream_name);
+    print "$field_name.value $field_value";
+}
+
+
+# http://guide.munin-monitoring.org/en/latest/reference/plugin.html#notes-on-fieldnames
+# The characters must be [a-zA-Z0-9_], while the first character must be [a-zA-Z_].
+sub convert_upstream_name {
+    my ($name) = @_;
+    $name =~ s/^[0-9]/x$&/; # no leading digits allowed
+    $name =~ s/[^a-zA-Z0-9_]+/_/g; # no leading digits allowed
+    $name =~ s/_+$//g; # remove trailing underscores
+    return $name;
+}
+	
+# vim: ft=perl : sw=4 : ts=4 : et
