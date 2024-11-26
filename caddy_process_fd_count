@@ -1,0 +1,99 @@
+#!/usr/bin/perl -l
+
+=head1 NAME
+
+caddy_process_fd_count - Reports on the how many open file descriptors Caddy has
+
+=head1 CONFIGURATION
+
+None
+
+=head1 USAGE
+
+The Caddy admin API must be enabled at http://localhost:2019/ to query the fd info
+
+=head1 AUTHOR
+
+Matt Peperell <matt@peperell.com>
+
+=head1 LICENSE
+
+MIT
+
+=cut
+
+use strict;
+use warnings;
+
+require LWP::UserAgent;
+my $ua = LWP::UserAgent->new(agent => "munin-caddy_process_fd_count/0.1", timeout => 10);
+
+use constant API => 'http://localhost:2019/metrics';
+
+
+
+my $graph_info = "Caddy";
+
+my $mode = (${ARGV[0] or "print"});
+
+if ($mode eq 'autoconfig') {
+    print "no";
+    exit 0;
+}
+
+
+#   # HELP process_max_fds Maximum number of open file descriptors.
+#   # TYPE process_max_fds gauge
+#   process_max_fds 1.048576e+06
+#   # HELP process_open_fds Number of open file descriptors.
+#   # TYPE process_open_fds gauge
+#   process_open_fds 46
+
+
+if ($mode eq 'config') {
+    print  <<"EOT";
+host_name $ENV{FQDN}
+graph_category system
+graph_info Maximum and current number of open file descriptors
+graph_title Files open by Caddy
+graph_vlabel fd count
+process_open_fds.type GAUGE
+process_max_fds.type GAUGE
+process_open_fds.label open fds
+process_max_fds.label max fds
+EOT
+    exit 0;
+}
+
+
+# We're in fetch mode if no argument is given
+my $response = $ua->get(API);
+my $body = $response->content();
+my @lines = split(/\n/, $body);
+
+if (!$response->is_success) {
+    print "process_max_fds.value U";
+    print "process_open_fds.value U";
+    exit 0;
+}
+
+foreach (@lines) {
+    next unless /^(process_(max|open)_fds) (.+)$/;
+    my $field_name = $1;
+    my $field_value = convert_scientific_number($3);
+    print "$field_name.value $field_value";
+}
+
+
+sub convert_scientific_number {
+    my ($value) = @_;
+
+    if (! /(\d\.\d+)e([+-]\d+)/ ) {
+        # return the input unchanged
+        return $value;
+    }
+    $value = $1 * (10 ** $2);
+    return $value;
+}
+	
+# vim: ft=perl : sw=4 : ts=4 : et
