@@ -1,0 +1,247 @@
+#!/usr/bin/perl -l
+
+=head1 NAME
+
+caddy_site_activity - Reports on activity for caddy sites
+
+=head1 CONFIGURATION
+
+None
+
+=head1 USAGE
+
+The Caddy admin API must be enabled at http://localhost:2019/ for the server config to be readable
+
+=head1 AUTHOR
+
+Matt Peperell <matt@peperell.com>
+
+=head1 LICENSE
+
+MIT
+
+=cut
+use Data::Dumper;
+use strict;
+use warnings;
+require JSON;
+
+require LWP::UserAgent;
+my $ua = LWP::UserAgent->new(agent => "munin-caddy_site_activity/0.1", timeout => 10);
+
+use constant API => 'http://localhost:2019/config';
+
+my $response = $ua->get(API);
+
+
+my @status_groups = ( 200, [301, 302, 308], 400, 404, 500 );
+
+my $mode = (${ARGV[0] or "print"});
+
+my $body = $response->content();
+
+#########################
+if ($mode eq 'autoconf') {
+    if (!$response->is_success) {
+        print "no (Could not talk to caddy at ". API . ")";
+    } else {
+        print "yes";
+    }
+    exit 0;
+}
+
+sub internal_name_to_site_name {
+    my ($internal_name, $mapping) = @_;
+    foreach (keys %{$mapping}) {
+       return $_ if ($internal_name eq $$mapping{$_}) ;
+    }
+    return "unknown"; # this shouldn't happen, but let's at least return a string rather than undef or erroring
+}
+
+sub find_group_for_status {
+    my ($given_status) = @_;
+    foreach my $status_group (@status_groups) {
+        if (ref $status_group eq 'ARRAY') {
+            foreach my $status (@{$status_group}) {
+                return $status if ($status eq $given_status);
+            }
+        } else {
+            # It's a scalar, not a group
+            return $status_group if ($status_group eq $given_status);
+        }
+    }
+    return "other";
+}
+
+sub count_json_log_hits {
+    my ($logfile_path, $window_start, $window_end, $statuses) = @_;
+    my %hits;
+    foreach my $status_group (@status_groups) {
+        if (ref $status_group eq 'ARRAY') {
+            $hits{$$status_group[0]} = 0;
+            next;
+        } else {
+            $hits{$status_group} = 0;
+        }
+    }
+
+
+    # TODO log the inability to read the logs. likely cause is missing config to run the plugin as the caddy user
+    open(LOG_FILE, "<$logfile_path") || return %hits; 
+    while (<LOG_FILE>) {
+        my $log_line = JSON->new->decode($_);
+        # For optimisation reasons, this function assumes that the log file is
+        # written in time order
+        return %hits if ($$log_line{ts} > $window_end);
+        $hits{find_group_for_status($$log_line{status})}++ if $$log_line{ts} >= $window_start;
+    }
+    return %hits;
+}
+
+
+# given a http status code, returns a munin-friendly field name
+# to represent that status, based on the configured groupings
+# e.g. given a grouping of ( 200, [301, 308], 404), the following
+# statuses give the field name shown
+#    200 -> status_200
+#    301 -> status_301
+#    302 -> status_other
+#    308 -> status_301
+#    500 -> status_other
+sub status_to_field_name {
+    my ($status) = @_;
+    my ($group) = find_group_for_status($status);
+    return "status_$group";
+}
+
+#########################
+if ($mode eq 'config') {
+    if (!$response->is_success) {
+        # Could not talk to Caddy API; we can't report about any metrics
+        exit 0;
+    }
+
+    # field for each 
+    my $config = JSON->new->decode($body);
+
+    # FIXME srv0 here might not be what's needed in the generic case. If caddy
+    # listens on port 80 and serve traffic directly on that too rather than
+    # redirecting, or perhaps want to additionally log the plain requests then
+    # we'd need to search other sections under apps->http->servers too.
+    my $caddy_internal_names = $config->{apps}{http}{servers}{srv0}{logs}{logger_names};
+
+    while (my ($internal_name, $logfile) = each %{$config->{logging}{logs}}) {
+        # ensure we can deal with this logger type
+        if ($logfile->{writer}{output} ne "file") {
+            # We don't yet read from sources other than file
+            next;
+        }
+        if ($logfile->{encoder}{format} ne "json") {
+            # We only know how to read JSON files
+            next;
+        }
+       my $orig_site_name;
+
+       my $site_name = internal_name_to_site_name($internal_name, $caddy_internal_names);
+       next if $site_name eq "unknown";
+       my $safe_site_name = convert_site_name($site_name);
+
+        my $basic = <<"EOT";
+multigraph caddy_site_hits_site_$safe_site_name
+graph_category webserver
+graph_info Caddy site hits by each status group for $site_name
+graph_title Site hits by status for $site_name
+graph_vlabel Hits
+EOT
+        chomp $basic;
+        print $basic;
+        my @unique_status_groups = qw(other);
+        foreach my $status_group (@status_groups) {
+            if (ref $status_group eq 'ARRAY') {
+                push @unique_status_groups, $$status_group[0];
+                next;
+            } else {
+                push @unique_status_groups, $status_group;
+            }
+        }
+
+        foreach (@unique_status_groups) {
+            my $field_name = status_to_field_name($_);
+            print "$field_name.type GAUGE";
+            print "$field_name.info Number of hits in a 5 minute period of the given status";
+            print "$field_name.min 0";
+            print "$field_name.label status $_"; # FIXME show all statuses for this group
+        }
+    }
+    exit 0;
+}
+#########################
+
+# We're in fetch mode if no argument is given
+my $now = time;
+if (!$response->is_success) {
+    # Could not talk to Caddy API; we can't report about any metrics
+    exit 0;
+}
+
+# field for each 
+my $config = JSON->new->decode($body);
+
+# FIXME srv0 here might not be what's needed in the generic case. If people
+# listen on port 80 and serve traffic directly on that too rather than
+# redirecting, or perhaps want to additionally log the plain requests then
+# we'd need to search other sections under apps->http->servers too.
+my $caddy_internal_names = $config->{apps}{http}{servers}{srv0}{logs}{logger_names};
+
+while (my ($internal_name, $logfile) = each %{$config->{logging}{logs}}) {
+    # ensure we can deal with this logger type
+    if ($logfile->{writer}{output} ne "file") {
+        # We don't yet read from sources other than file
+        next;
+    }
+    if ($logfile->{encoder}{format} ne "json") {
+        # We only know how to read JSON files
+        next;
+    }
+
+    my $site_name = internal_name_to_site_name($internal_name, $caddy_internal_names);
+    my $safe_site_name = convert_site_name($site_name);
+    print "multigraph caddy_site_hits_site_$safe_site_name";
+
+    if ($site_name eq "unknown") {
+        foreach my $status_group (@status_groups) {
+            if (ref $status_group eq 'ARRAY') {
+                my $field_name = status_to_field_name($$status_group[0]);
+                print "$field_name.value U";
+                next;
+            } else {
+                my $field_name = status_to_field_name($status_group);
+                print "$field_name.value U";
+            }
+        }
+    } else {
+        my $safe_site_name = convert_site_name($site_name);
+        my %hits= count_json_log_hits($logfile->{writer}{filename}, $now-(60*5), $now, @status_groups);
+
+
+        foreach my $group (keys(%hits)) {
+            my $field_name = status_to_field_name($group);
+            print "$field_name.value $hits{$group}";
+            #print "$group.value 999";
+
+        }
+    }
+}
+
+
+# http://guide.munin-monitoring.org/en/latest/reference/plugin.html#notes-on-fieldnames
+# The characters must be [a-zA-Z0-9_], while the first character must be [a-zA-Z_].
+sub convert_site_name {
+    my ($name) = @_;
+    $name =~ s/^[0-9]/x$&/; # no leading digits allowed
+    $name =~ s/\./_/g; # no internal dots allowed
+    $name =~ s/\-/_/g; # no internal dots allowed
+    return $name;
+}
+	
+# vim: ft=perl : sw=4 : ts=4 : et : foldmethod=indent : foldlevel=6
